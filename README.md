@@ -1,4 +1,4 @@
-#Moving Object Detection
+# KNN + Kalman Object Detection (Streamlit)
 
 This Streamlit app performs simple object detection and tracking without deep learning. It uses background subtraction to find moving objects, extracts simple features, clusters initial observations with KMeans to create pseudo-labels, trains a KNN classifier, and optionally uses a Kalman filter to smooth tracking.
 
