@@ -1,406 +1,365 @@
-"""
-Object Detection Model
-KNN + Kalman Filter Implementation
-"""
+# ===================================
+# Object Detection Application
+# Using KNN Classification + Kalman Filter Tracking
+# ===================================
 
+import streamlit as st
 import cv2
 import numpy as np
+import tempfile
 import time
 from sklearn.cluster import KMeans
 from sklearn.neighbors import KNeighborsClassifier
 from filterpy.kalman import KalmanFilter
 
+# Configure Streamlit page settings
+st.set_page_config(page_title="Object Detection", layout="wide")
 
-class ObjectDetectionModel:
+st.title("Object Detection")
+
+# ===================================
+# Sidebar Controls - User Parameters
+# ===================================
+st.sidebar.header("Detection & Model Settings")
+
+# Video upload widget
+upload = st.sidebar.file_uploader("Upload a video", type=["mp4", "avi", "mov", "mkv"]) 
+
+# Machine Learning parameters
+n_neighbors = st.sidebar.slider("K (neighbors) for KNN", 1, 15, 3)  # KNN classifier parameter
+n_clusters = st.sidebar.slider("Clusters for initial KMeans", 1, 8, 3)  # Number of object types
+
+# Detection parameters
+min_area = st.sidebar.slider("Min contour area", 50, 5000, 400)  # Filter small detections
+bg_var_threshold = st.sidebar.slider("Background Subtractor varThreshold", 5, 100, 25)  # Sensitivity
+
+# Tracking and visualization options
+use_kalman = st.sidebar.checkbox("Enable Kalman Filter Tracking", value=True)  # Smooth tracking
+bbox_color = st.sidebar.color_picker("Bounding box color", value="#00FF00")  # Green default
+bbox_thickness = st.sidebar.slider("Bounding box thickness", 1, 6, 2)
+
+# Processing parameters
+collect_frames = st.sidebar.slider("Frames to collect for clustering", 5, 120, 30)  # Training data
+fps_limit = st.sidebar.slider("Max FPS (processing)", 1, 30, 15)  # Control processing speed
+
+# Control buttons
+st.sidebar.markdown("---")
+play_button = st.sidebar.button("Play / Start Processing")
+stop_button = st.sidebar.button("Stop")
+
+
+# ===================================
+# Kalman Filter Setup
+# ===================================
+def create_kalman():
     """
-    Object Detection using KNN classification and Kalman Filter tracking
+    Create a Kalman Filter for smooth object tracking
+    State vector: [x, y, vx, vy] - position and velocity
+    Measurement: [x, y] - observed position
     """
+    # 4 state variables: x, y, vx, vy ; 2 measurements: x, y
+    kf = KalmanFilter(dim_x=4, dim_z=2)
     
-    def __init__(self, 
-                 n_neighbors=3, 
-                 n_clusters=3, 
-                 min_area=400,
-                 bg_var_threshold=25,
-                 use_kalman=True,
-                 collect_frames=30):
-        """
-        Initialize the object detection model
-        
-        Parameters:
-        - n_neighbors: Number of neighbors for KNN classifier
-        - n_clusters: Number of clusters for KMeans
-        - min_area: Minimum contour area to consider
-        - bg_var_threshold: Background subtractor variance threshold
-        - use_kalman: Enable/disable Kalman filter tracking
-        - collect_frames: Number of frames to collect before training
-        """
-        self.n_neighbors = n_neighbors
-        self.n_clusters = n_clusters
-        self.min_area = min_area
-        self.bg_var_threshold = bg_var_threshold
-        self.use_kalman = use_kalman
-        self.collect_frames = collect_frames
-        
-        # Initialize background subtractor
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500, 
-            varThreshold=bg_var_threshold, 
-            detectShadows=False
-        )
-        
-        # Model components
-        self.knn_model = None
-        self.labeler = None
-        self.trackers = {}
-        
-        # Feature collection
-        self.collected_features = []
-        self.frame_count = 0
-        self.is_trained = False
+    # State transition matrix (F): predicts next state from current state
+    kf.F = np.array([[1, 0, 1, 0],  # x = x + vx
+                     [0, 1, 0, 1],  # y = y + vy
+                     [0, 0, 1, 0],  # vx = vx (constant velocity)
+                     [0, 0, 0, 1]]) # vy = vy
     
-    def create_kalman(self):
-        """
-        Create a Kalman Filter for object tracking
-        4 states: x, y, vx, vy
-        2 measurements: x, y
-        """
-        kf = KalmanFilter(dim_x=4, dim_z=2)
-        kf.F = np.array([[1, 0, 1, 0],
-                         [0, 1, 0, 1],
-                         [0, 0, 1, 0],
-                         [0, 0, 0, 1]])
-        kf.H = np.array([[1, 0, 0, 0],
-                         [0, 1, 0, 0]])
-        kf.R *= 10.0
-        kf.P *= 1000.0
-        kf.Q = np.eye(4) * 0.01
-        return kf
+    # Measurement matrix (H): extracts position from state
+    kf.H = np.array([[1, 0, 0, 0],  # measure x
+                     [0, 1, 0, 0]]) # measure y
     
-    def extract_features(self, contour, frame_shape):
-        """
-        Extract features from a contour
-        Features: normalized centroid x,y, normalized area, aspect ratio
-        """
-        x, y, w, h = cv2.boundingRect(contour)
-        area = cv2.contourArea(contour)
-        cx = x + w / 2.0
-        cy = y + h / 2.0
-        fw, fh = frame_shape[1], frame_shape[0]
-        
-        return [
-            cx / fw,  # normalized x
-            cy / fh,  # normalized y
-            area / (fw * fh),  # normalized area
-            float(w) / float(h + 1e-6)  # aspect ratio
-        ]
+    # Noise covariance matrices
+    kf.R *= 10.0      # Measurement noise (observation uncertainty)
+    kf.P *= 1000.0    # Initial state covariance (initial uncertainty)
+    kf.Q = np.eye(4) * 0.01  # Process noise (model uncertainty)
+    return kf
+
+
+# ===================================
+# Feature Extraction
+# ===================================
+def extract_features(cnt, frame_shape):
+    """
+    Extract features from a detected contour
+    Returns: [normalized_x, normalized_y, normalized_area, aspect_ratio]
+    """
+    # Get bounding rectangle and calculate features
+    x, y, w, h = cv2.boundingRect(cnt)
+    area = cv2.contourArea(cnt)
+    cx = x + w / 2.0
+    cy = y + h / 2.0
+    fw, fh = frame_shape[1], frame_shape[0]
+    return [cx / fw, cy / fh, area / (fw * fh), float(w) / float(h + 1e-6)]
+
+
+# ===================================
+# Frame Processing Pipeline
+# ===================================
+def process_frame(frame, bg_subtractor, knn_model, labeler, trackers, settings):
+    """
+    Main processing pipeline for each frame
+    Steps: preprocessing → background subtraction → contour detection → 
+           feature extraction → classification → tracking → visualization
+    """
+    # Step 1: Preprocessing - reduce noise and prepare for background subtraction
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)  # Gaussian blur to reduce noise
+
+    # Step 2: Background subtraction to detect moving objects
+    fgmask = bg_subtractor.apply(blur)
+    _, thresh = cv2.threshold(fgmask, 244, 255, cv2.THRESH_BINARY)  # Binary threshold
     
-    def train_model(self):
-        """
-        Train KNN model using collected features
-        Uses KMeans for clustering to create pseudo-labels
-        """
-        if len(self.collected_features) == 0:
-            print("No features collected for training")
-            return False
+    # Step 3: Morphological operations to clean up the mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)   # Remove noise
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_DILATE, kernel, iterations=2) # Fill gaps
+
+    # Step 4: Find contours (object boundaries)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Step 5: Extract features and create detection objects
+    detections = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
         
-        try:
-            # Use KMeans to create pseudo-labels
-            n_clusters = min(self.n_clusters, max(1, len(self.collected_features)))
-            kmeans = KMeans(n_clusters=n_clusters, random_state=0)
-            labels = kmeans.fit_predict(self.collected_features)
-            
-            # Train KNN classifier
-            self.knn_model = KNeighborsClassifier(n_neighbors=self.n_neighbors)
-            self.knn_model.fit(self.collected_features, labels)
-            self.labeler = kmeans
-            self.is_trained = True
-            
-            print(f"Model trained with {len(self.collected_features)} features and {n_clusters} clusters")
-            return True
-        except Exception as e:
-            print(f"Error training model: {e}")
-            return False
-    
-    def detect_objects(self, frame):
-        """
-        Detect objects in a frame
-        Returns list of detections with bounding boxes, features, and labels
-        """
-        # Preprocessing
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Filter out small contours (noise)
+        if area < settings['min_area']:
+            continue
         
-        # Background subtraction
-        fgmask = self.bg_subtractor.apply(blur)
-        _, thresh = cv2.threshold(fgmask, 244, 255, cv2.THRESH_BINARY)
+        # Get bounding box and extract features
+        x, y, w, h = cv2.boundingRect(cnt)
+        feat = extract_features(cnt, frame.shape)
         
-        # Morphological operations
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_DILATE, kernel, iterations=2)
+        # Store detection information
+        detections.append({
+            'bbox': (x, y, w, h), 
+            'feature': feat, 
+            'centroid': (int(x + w/2), int(y + h/2)), 
+            'area': area
+        })
+
+    # Step 6: Classify detections using trained KNN model
+    for det in detections:
+        if knn_model is not None and len(detections) > 0:
+            # Predict object class based on extracted features
+            pred = knn_model.predict([det['feature']])[0]
+        else:
+            # Model not trained yet, use placeholder label
+            pred = -1
+        det['label'] = pred
+
+    # Step 7: Update Kalman Filter trackers for smooth tracking
+    for det in detections:
+        lbl = det['label']
+        cx, cy = det['centroid']
         
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        detections = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.min_area:
-                continue
-            
-            x, y, w, h = cv2.boundingRect(cnt)
-            feat = self.extract_features(cnt, frame.shape)
-            centroid = (int(x + w/2), int(y + h/2))
-            
-            detection = {
-                'bbox': (x, y, w, h),
-                'feature': feat,
-                'centroid': centroid,
-                'area': area
-            }
-            
-            # Classify if model is trained
-            if self.is_trained and self.knn_model is not None:
-                pred = self.knn_model.predict([feat])[0]
-                detection['label'] = pred
+        if settings['use_kalman']:
+            if lbl not in trackers:
+                # Create new tracker for this object class
+                kf = create_kalman()
+                kf.x = np.array([cx, cy, 0, 0], dtype=float)  # Initialize with current position
+                trackers[lbl] = {'kf': kf, 'last_seen': time.time()}
             else:
-                detection['label'] = -1
+                # Update existing tracker
+                trackers[lbl]['kf'].predict()  # Predict next position
+                trackers[lbl]['kf'].update(np.array([cx, cy]))  # Correct with measurement
+                trackers[lbl]['last_seen'] = time.time()
             
-            detections.append(detection)
-        
-        return detections, thresh
-    
-    def update_trackers(self, detections):
-        """
-        Update Kalman filter trackers for detected objects
-        """
-        if not self.use_kalman:
-            for det in detections:
-                det['kf_centroid'] = det['centroid']
-            return
-        
-        # Update trackers
-        for det in detections:
-            lbl = det['label']
-            cx, cy = det['centroid']
-            
-            if lbl not in self.trackers:
-                kf = self.create_kalman()
-                kf.x = np.array([cx, cy, 0, 0], dtype=float)
-                self.trackers[lbl] = {'kf': kf, 'last_seen': time.time()}
-            else:
-                self.trackers[lbl]['kf'].predict()
-                self.trackers[lbl]['kf'].update(np.array([cx, cy]))
-                self.trackers[lbl]['last_seen'] = time.time()
-            
-            # Use Kalman estimate for smoother tracking
-            kf = self.trackers[lbl]['kf']
+            # Use Kalman-smoothed position for display
+            kf = trackers[lbl]['kf']
             det['kf_centroid'] = (int(kf.x[0]), int(kf.x[1]))
+        else:
+            # Kalman disabled: use raw detection centroid
+            det['kf_centroid'] = det['centroid']
+
+    # Step 8: Remove stale trackers (objects no longer visible)
+    stale = []
+    for lbl, info in trackers.items():
+        if time.time() - info['last_seen'] > 1.5:  # 1.5 seconds timeout
+            stale.append(lbl)
+    for lbl in stale:
+        del trackers[lbl]
+
+    # Step 9: Visualization - draw bounding boxes, centroids, and labels
+    out = frame.copy()
+    for det in detections:
+        x, y, w, h = det['bbox']
+        cx, cy = det['kf_centroid']  # Use Kalman-smoothed position
+        label = det.get('label', -1)
         
-        # Remove stale trackers (not seen for 1.5 seconds)
-        stale = [lbl for lbl, info in self.trackers.items() 
-                 if time.time() - info['last_seen'] > 1.5]
-        for lbl in stale:
-            del self.trackers[lbl]
-    
-    def process_frame(self, frame):
-        """
-        Process a single frame and return annotated output
+        # Convert hex color to BGR tuple for OpenCV
+        color = settings['color']
+        hexc = color.lstrip('#')
+        bc = tuple(int(hexc[i:i+2], 16) for i in (0, 2, 4))  # RGB
+        bc = (bc[2], bc[1], bc[0])  # Convert to BGR
         
-        Returns:
-        - annotated_frame: Frame with bounding boxes and labels
-        - mask: Binary mask showing detected motion
-        - detections: List of detection dictionaries
-        """
-        self.frame_count += 1
-        
-        # Collect features for training if not trained yet
-        if not self.is_trained and self.frame_count <= self.collect_frames:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            blur = cv2.GaussianBlur(gray, (5, 5), 0)
-            fgmask = self.bg_subtractor.apply(blur)
-            _, thresh = cv2.threshold(fgmask, 244, 255, cv2.THRESH_BINARY)
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for cnt in contours:
-                if cv2.contourArea(cnt) < self.min_area:
-                    continue
-                feat = self.extract_features(cnt, frame.shape)
-                self.collected_features.append(feat)
-            
-            # Train model after collecting enough frames
-            if self.frame_count == self.collect_frames:
-                self.train_model()
-        
-        # Detect objects
-        detections, mask = self.detect_objects(frame)
-        
-        # Update trackers
-        self.update_trackers(detections)
-        
-        # Annotate frame
-        annotated_frame = self.draw_detections(frame.copy(), detections)
-        
-        return annotated_frame, mask, detections
-    
-    def draw_detections(self, frame, detections, color=(0, 255, 0), thickness=2):
-        """
-        Draw bounding boxes and labels on frame
-        
-        Parameters:
-        - frame: Input frame to annotate
-        - detections: List of detection dictionaries
-        - color: BGR color tuple
-        - thickness: Line thickness
-        """
-        for det in detections:
-            x, y, w, h = det['bbox']
-            cx, cy = det.get('kf_centroid', det['centroid'])
-            label = det.get('label', -1)
-            
-            # Draw bounding box
-            cv2.rectangle(frame, (x, y), (x+w, y+h), color, thickness)
-            
-            # Draw centroid
-            cv2.circle(frame, (cx, cy), 3, color, -1)
-            
-            # Draw label
-            cv2.putText(frame, f"ID:{label}", (x, y-6), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        
-        return frame
-    
-    def process_video(self, video_path, output_path=None, max_frames=None, 
-                     display=False, bbox_color=(0, 255, 0), bbox_thickness=2):
-        """
-        Process an entire video file
-        
-        Parameters:
-        - video_path: Path to input video
-        - output_path: Path to save output video (optional)
-        - max_frames: Maximum number of frames to process (optional)
-        - display: Show output in window (requires GUI environment)
-        - bbox_color: Color for bounding boxes (BGR)
-        - bbox_thickness: Thickness of bounding boxes
-        
-        Returns:
-        - stats: Dictionary with processing statistics
-        """
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"Error: Could not open video {video_path}")
-            return None
-        
-        # Get video properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        print(f"Video: {width}x{height} @ {fps} FPS, {total_frames} frames")
-        
-        # Setup video writer if output path provided
-        writer = None
-        if output_path:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        # Processing statistics
-        stats = {
-            'total_frames_processed': 0,
-            'total_detections': 0,
-            'processing_time': 0
-        }
-        
-        start_time = time.time()
-        frame_idx = 0
-        
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            frame_idx += 1
-            if max_frames and frame_idx > max_frames:
-                break
-            
-            # Process frame
-            annotated_frame, mask, detections = self.process_frame(frame)
-            
-            # Draw with custom color
-            annotated_frame = self.draw_detections(
-                frame.copy(), detections, 
-                color=bbox_color, thickness=bbox_thickness
-            )
-            
-            # Update statistics
-            stats['total_frames_processed'] += 1
-            stats['total_detections'] += len(detections)
-            
-            # Write to output
-            if writer:
-                writer.write(annotated_frame)
-            
-            # Display if requested
-            if display:
-                cv2.imshow('Object Detection', annotated_frame)
-                cv2.imshow('Mask', mask)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-            
-            # Progress update
-            if frame_idx % 30 == 0:
-                print(f"Processed {frame_idx}/{total_frames} frames, "
-                      f"Detections: {len(detections)}")
-        
-        stats['processing_time'] = time.time() - start_time
-        
-        # Cleanup
-        cap.release()
-        if writer:
-            writer.release()
-        if display:
-            cv2.destroyAllWindows()
-        
-        print(f"\nProcessing complete!")
-        print(f"Frames processed: {stats['total_frames_processed']}")
-        print(f"Total detections: {stats['total_detections']}")
-        print(f"Processing time: {stats['processing_time']:.2f} seconds")
-        print(f"Average FPS: {stats['total_frames_processed']/stats['processing_time']:.2f}")
-        
-        return stats
+        # Draw bounding box
+        cv2.rectangle(out, (x, y), (x+w, y+h), bc, settings['thickness'])
+        # Draw centroid point
+        cv2.circle(out, (cx, cy), 3, bc, -1)
+        # Draw label
+        cv2.putText(out, f"ID:{label}", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bc, 1)
+
+    return out, thresh
 
 
-# Example usage for presentation
-if __name__ == '__main__':
-    # Create model instance
-    model = ObjectDetectionModel(
-        n_neighbors=3,
-        n_clusters=3,
-        min_area=400,
-        bg_var_threshold=25,
-        use_kalman=True,
-        collect_frames=30
+# ===================================
+# Main Application
+# ===================================
+def main():
+    """Main application logic for video processing and display"""
+    st.sidebar.markdown("Upload a video and press Play to start processing.")
+
+    # Create two columns for side-by-side display
+    col1, col2 = st.columns(2)
+    orig_slot = col1.empty()  # Placeholder for original video
+    proc_slot = col2.empty()  # Placeholder for processed video
+
+    # Check if video is uploaded
+    if upload is None:
+        st.info("Please upload a video file from the sidebar to begin.")
+        return
+
+    # Save uploaded file to temporary location
+    tfile = tempfile.NamedTemporaryFile(delete=False)
+    tfile.write(upload.read())
+    tfile.flush()
+
+    # Open video capture
+    cap = cv2.VideoCapture(tfile.name)
+    if not cap.isOpened():
+        st.error("Unable to open uploaded video.")
+        return
+
+    # Initialize background subtractor (MOG2 algorithm)
+    # Learns background model over time to detect moving foreground objects
+    bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+        history=500,                      # Number of frames for background model
+        varThreshold=bg_var_threshold,    # Threshold for pixel classification
+        detectShadows=False               # Disable shadow detection for speed
     )
-    
-    # Example: Process a video
-    # Replace 'input_video.mp4' with your video path
-    video_path = 'input_video.mp4'
-    output_path = 'output_video.mp4'
-    
-    # Process video (comment out if you don't have a video file)
-    # stats = model.process_video(
-    #     video_path=video_path,
-    #     output_path=output_path,
-    #     max_frames=None,  # Process all frames
-    #     display=False,  # Set to True to show live display
-    #     bbox_color=(0, 255, 0),  # Green
-    #     bbox_thickness=2
-    # )
-    
-    print("Model ready for presentation!")
-    print("\nKey components:")
-    print("- KNN Classifier for object classification")
-    print("- Kalman Filter for smooth tracking")
-    print("- Background subtraction for motion detection")
-    print("- Feature extraction: centroid, area, aspect ratio")
+
+    # Initialize model components
+    collected_features = []  # Features collected during warm-up phase
+    collected_labels = []    # Labels from KMeans clustering
+    knn_model = None         # KNN classifier (trained after warm-up)
+    labeler = None           # KMeans model for clustering
+    trackers = {}            # Dictionary of Kalman filters per object class
+
+    # Session state for play/stop control
+    if 'playing' not in st.session_state:
+        st.session_state.playing = False
+    if play_button:
+        st.session_state.playing = True
+    if stop_button:
+        st.session_state.playing = False
+
+    # Pack settings into dictionary for easy passing
+    settings = {
+        'min_area': min_area,           # Minimum area threshold
+        'use_kalman': use_kalman,       # Enable Kalman filtering
+        'color': bbox_color,            # Bounding box color
+        'thickness': bbox_thickness     # Bounding box line thickness
+    }
+
+    # Calculate frame delay for FPS limiting
+    frame_time = 1.0 / max(1, fps_limit)
+
+    # ===================================
+    # Main Video Processing Loop
+    # ===================================
+    frame_idx = 0
+    while cap.isOpened() and st.session_state.playing:
+        ret, frame = cap.read()
+        if not ret:  # End of video
+            break
+
+        frame_idx += 1
+
+        # Optimize performance: downscale large frames
+        h, w = frame.shape[:2]
+        max_dim = 800
+        if max(h, w) > max_dim:
+            scale = max_dim / float(max(h, w))
+            frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
+
+        # ===================================
+        # Phase 1: Warm-up - Collect training data
+        # ===================================
+        # Collect features from first N frames for KMeans clustering
+        gray_tmp = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur_tmp = cv2.GaussianBlur(gray_tmp, (5,  5), 0)
+        fgmask_tmp = bg_subtractor.apply(blur_tmp)
+        _, thresh_tmp = cv2.threshold(fgmask_tmp, 244, 255, cv2.THRESH_BINARY)
+        contours_tmp, _ = cv2.findContours(thresh_tmp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Extract and store features from all detected objects
+        for cnt in contours_tmp:
+            if cv2.contourArea(cnt) < settings['min_area']:
+                continue
+            feat = extract_features(cnt, frame.shape)
+            collected_features.append(feat)
+
+        # ===================================
+        # Phase 2: Train Models
+        # ===================================
+        # After collecting enough features, train KMeans and KNN
+        if frame_idx == collect_frames and len(collected_features) > 0:
+            # Two-stage learning:
+            # 1. KMeans: Unsupervised clustering to discover object classes
+            # 2. KNN: Supervised classifier trained on cluster labels
+            try:
+                # Ensure we have enough samples for training
+                n_samples = len(collected_features)
+                if n_samples < 2:
+                    # Not enough samples to train, skip training
+                    knn_model = None
+                else:
+                    # Step 1: Cluster features into object types
+                    kmeans = KMeans(
+                        n_clusters=min(n_clusters, max(1, n_samples)), 
+                        random_state=0
+                    ).fit(collected_features)
+                    labels = kmeans.labels_
+                    
+                    # Step 2: Train KNN classifier with appropriate n_neighbors
+                    # Ensure n_neighbors doesn't exceed number of samples
+                    actual_neighbors = min(n_neighbors, n_samples)
+                    knn_model = KNeighborsClassifier(n_neighbors=actual_neighbors)
+                    knn_model.fit(collected_features, labels)
+                    labeler = kmeans
+            except Exception as e:
+                knn_model = None  # Training failed, continue without classification
+                st.warning(f"Model training failed: {str(e)}")
+
+        # ===================================
+        # Phase 3: Process Current Frame
+        # ===================================
+        # Apply full detection pipeline to current frame
+        out_frame, mask = process_frame(frame, bg_subtractor, knn_model, labeler, trackers, settings)
+
+        # Convert BGR (OpenCV) to RGB (Streamlit)
+        orig_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        out_rgb = cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB)
+
+        # Display frames side-by-side
+        display_w = min(800, frame.shape[1])  # Limit width for performance
+        orig_slot.image(orig_rgb, caption="Original", width=display_w)
+        proc_slot.image(out_rgb, caption="Detection Output", width=display_w)
+
+        # Control processing speed (FPS limiting)
+        time.sleep(frame_time)
+
+    # Cleanup
+    cap.release()
+
+    st.sidebar.markdown("Processing stopped.")
+
+
+# ===================================
+# Application Entry Point
+# ===================================
+if __name__ == '__main__':
+    main()
