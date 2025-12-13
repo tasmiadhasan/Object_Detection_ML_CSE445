@@ -13,7 +13,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from filterpy.kalman import KalmanFilter
 
 # Configure Streamlit page settings
-st.set_page_config(page_title="KNN + Kalman Object Detection", layout="wide")
+st.set_page_config(page_title="Object Detection", layout="wide")
 
 st.title("Object Detection")
 
