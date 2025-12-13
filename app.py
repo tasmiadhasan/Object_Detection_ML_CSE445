@@ -311,19 +311,28 @@ def main():
             # 1. KMeans: Unsupervised clustering to discover object classes
             # 2. KNN: Supervised classifier trained on cluster labels
             try:
-                # Step 1: Cluster features into object types
-                kmeans = KMeans(
-                    n_clusters=min(n_clusters, max(1, len(collected_features))), 
-                    random_state=0
-                ).fit(collected_features)
-                labels = kmeans.labels_
-                
-                # Step 2: Train KNN classifier on clustered data
-                knn_model = KNeighborsClassifier(n_neighbors=n_neighbors)
-                knn_model.fit(collected_features, labels)
-                labeler = kmeans
-            except Exception:
+                # Ensure we have enough samples for training
+                n_samples = len(collected_features)
+                if n_samples < 2:
+                    # Not enough samples to train, skip training
+                    knn_model = None
+                else:
+                    # Step 1: Cluster features into object types
+                    kmeans = KMeans(
+                        n_clusters=min(n_clusters, max(1, n_samples)), 
+                        random_state=0
+                    ).fit(collected_features)
+                    labels = kmeans.labels_
+                    
+                    # Step 2: Train KNN classifier with appropriate n_neighbors
+                    # Ensure n_neighbors doesn't exceed number of samples
+                    actual_neighbors = min(n_neighbors, n_samples)
+                    knn_model = KNeighborsClassifier(n_neighbors=actual_neighbors)
+                    knn_model.fit(collected_features, labels)
+                    labeler = kmeans
+            except Exception as e:
                 knn_model = None  # Training failed, continue without classification
+                st.warning(f"Model training failed: {str(e)}")
 
         # ===================================
         # Phase 3: Process Current Frame
